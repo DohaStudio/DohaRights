@@ -1,0 +1,1 @@
+"""DohaRights source package."""

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import datetime, timezone
 from threading import Barrier, Thread
@@ -8,24 +9,36 @@ from uuid import UUID, uuid4
 import pytest
 
 from src.doharights import (
+    CurrentUseAuthorization,
     DohaRightsAuthority,
+    HistoricalAcquisitionReceiptState,
     IssueRightsCommand,
     ReplaceRightsCommand,
     RevokeRightsCommand,
     RightsAuthorityError,
+    RightsEvidenceReference,
+    RightsEvidenceType,
     RightsLifecycleEventType,
     RightsPermissions,
     RightsRecord,
+    RightsRetention,
+    RightsRetentionMode,
+    RightsReview,
+    RightsSourceClassification,
     RightsSourceToken,
+    RightsStatus,
     RightsSubject,
     RightsSubjectKind,
     SourceAuthority,
     canonical_fingerprint,
 )
+from src.doharights.authority import canonical_bytes
+from src.doharights.postgres import rights_record_from_mapping
 
 NOW = datetime(2026, 9, 1, tzinfo=timezone.utc)
 SOURCE_ID = UUID("11111111-1111-4111-8111-111111111111")
 PRODUCER_ID = UUID("22222222-2222-4222-8222-222222222222")
+REVIEWER_ID = UUID("22222222-2222-4222-8222-333333333333")
 SUBJECT_ID = UUID("33333333-3333-4333-8333-333333333333")
 RECORD_ID = UUID("44444444-4444-4444-8444-444444444444")
 
@@ -45,7 +58,30 @@ def record(
         record_id,
         source or SourceAuthority(SOURCE_ID),
         subject(),
-        RightsPermissions(True, False, False, False),
+        RightsPermissions(True, False, False, False, True, True),
+        RightsStatus.APPROVED_LIMITED,
+        RightsSourceClassification("external", False, False, False, False, True),
+        RightsRetention(True, RightsRetentionMode.INDEFINITE_WHILE_CURRENT, "training"),
+        (),
+        "KR",
+        RightsReview(REVIEWER_ID, NOW),
+        CurrentUseAuthorization(
+            True,
+            "internal_noncommercial_model_training_and_evaluation",
+            False,
+            True,
+            HistoricalAcquisitionReceiptState.NOT_RECOVERED,
+            False,
+        ),
+        (
+            RightsEvidenceReference(
+                "evidence:aihub-current-usage-policy",
+                RightsEvidenceType.PROVIDER_USAGE_POLICY,
+                "AI Hub",
+                "https://aihub.or.kr/intrcn/guid/usagepolicy.do",
+                NOW,
+            ),
+        ),
         NOW,
         ("evidence:candidate-a-eligibility",),
         producer,
@@ -76,7 +112,9 @@ def test_source_subject_and_record_are_frozen_and_versioned() -> None:
     assert current.source_authority.origin_domain == "DohaRights"
     assert current.schema_version == "rights-authority-v1"
     assert current.subject.dataset_source_identity == "AIHUB-71748"
-    assert current.permissions == RightsPermissions(True, False, False, False)
+    assert current.permissions == RightsPermissions(True, False, False, False, True, True)
+    assert current.retention.mode is RightsRetentionMode.INDEFINITE_WHILE_CURRENT
+    assert current.consent_evidence_references == ()
     with pytest.raises((AttributeError, TypeError)):
         current.permissions.internal_training = False  # type: ignore[misc]
 
@@ -109,7 +147,7 @@ def test_canonical_fingerprint_has_golden_parity() -> None:
     assert value.fingerprint == canonical_fingerprint(value)
     assert (
         value.fingerprint
-        == "sha256:762010452bf4ad580a8f7edbab12f68cb378e9ee2fbdcc5ba0d0d0fcf05b8887"
+        == "sha256:968367e585436c200b370b49347ae67967852314c82996b4adb0ffe898ab45a1"
     )
 
 
@@ -145,6 +183,35 @@ def test_wrong_source_authority_is_rejected() -> None:
     service = authority()
     wrong = record(source=SourceAuthority(uuid4()))
     assert_code("RIGHTS_SOURCE_AUTHORITY_MISMATCH", lambda: service.issue(issue_command(wrong)))
+
+
+def test_reviewer_and_producer_must_be_distinct() -> None:
+    assert_code(
+        "RIGHTS_REVIEWER_PRODUCER_COLLISION",
+        lambda: replace(record(), review=RightsReview(PRODUCER_ID, NOW)),
+    )
+
+
+def test_current_use_facts_are_in_record_fingerprint_and_token() -> None:
+    base = record()
+    changed = replace(
+        base,
+        current_use_authorization=replace(
+            base.current_use_authorization,
+            historical_acquisition_receipt=HistoricalAcquisitionReceiptState.RECOVERED,
+        ),
+    )
+    assert base.fingerprint != changed.fingerprint
+    assert RightsSourceToken.issue(base, 1).token_fingerprint != (
+        RightsSourceToken.issue(changed, 1).token_fingerprint
+    )
+
+
+def test_canonical_current_use_record_round_trips_from_postgres_payload() -> None:
+    value = record()
+    restored = rights_record_from_mapping(json.loads(canonical_bytes(value)))
+    assert restored == value
+    assert restored.fingerprint == value.fingerprint
 
 
 def test_replace_is_append_only_and_old_token_becomes_stale() -> None:

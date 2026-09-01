@@ -1,10 +1,33 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
+
+from src.doharights import (
+    CurrentUseAuthorization,
+    HistoricalAcquisitionReceiptState,
+    IssueRightsCommand,
+    PostgresCurrentRightsAuthority,
+    ReplaceRightsCommand,
+    RightsAuthorityError,
+    RightsEvidenceReference,
+    RightsEvidenceType,
+    RightsPermissions,
+    RightsRecord,
+    RightsRetention,
+    RightsRetentionMode,
+    RightsReview,
+    RightsSourceClassification,
+    RightsStatus,
+    RightsSubject,
+    RightsSubjectKind,
+    SourceAuthority,
+)
 
 psycopg = pytest.importorskip("psycopg")
 
@@ -23,13 +46,91 @@ def test_fresh_migration_lifecycle_replay_and_scoped_reader() -> None:
     migration = Path("src/doharights/postgres_migrations/0001_rights_authority.sql").read_text(
         encoding="utf-8"
     )
+    current_use_migration = Path(
+        "src/doharights/postgres_migrations/0002_current_use_rights.sql"
+    ).read_text(encoding="utf-8")
     with psycopg.connect(DSN, autocommit=True) as admin:
         admin.execute(migration)
+        admin.execute(current_use_migration)
         admin.execute("CREATE ROLE rights_producer_py LOGIN PASSWORD 'doharights-test-only'")
         admin.execute("GRANT doharights_producer TO rights_producer_py")
         admin.execute("CREATE ROLE rights_reader_py LOGIN PASSWORD 'doharights-test-only'")
         admin.execute("GRANT doharights_reader TO rights_reader_py")
         admin.execute("CREATE ROLE rights_outsider_py LOGIN PASSWORD 'doharights-test-only'")
+
+    now = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    current_use_subject = RightsSubject(
+        UUID("66666666-6666-4666-8666-666666666666"),
+        "AIHUB-71748-current-use",
+        RightsSubjectKind.SOURCE_DATASET,
+        "AIHUB-71748-current-use",
+    )
+    current_use_record = RightsRecord(
+        UUID("77777777-7777-4777-8777-777777777777"),
+        SourceAuthority(UUID("11111111-1111-4111-8111-111111111111")),
+        current_use_subject,
+        RightsPermissions(True, False, False, False, True, True),
+        RightsStatus.APPROVED_LIMITED,
+        RightsSourceClassification("external", False, False, False, False, True),
+        RightsRetention(True, RightsRetentionMode.INDEFINITE_WHILE_CURRENT, "training"),
+        (),
+        "KR",
+        RightsReview(UUID("88888888-8888-4888-8888-888888888888"), now),
+        CurrentUseAuthorization(
+            True,
+            "internal_noncommercial_model_training_and_evaluation",
+            False,
+            True,
+            HistoricalAcquisitionReceiptState.NOT_RECOVERED,
+            False,
+        ),
+        (
+            RightsEvidenceReference(
+                "evidence:aihub-current-policy",
+                RightsEvidenceType.PROVIDER_USAGE_POLICY,
+                "AI Hub",
+                "https://aihub.or.kr/intrcn/guid/usagepolicy.do",
+                now,
+            ),
+        ),
+        now,
+        ("evidence:aihub-current-policy",),
+        UUID("22222222-2222-4222-8222-222222222222"),
+    )
+    writer = PostgresCurrentRightsAuthority(lambda: _connect_as("rights_producer_py"))
+    issued = writer.issue(
+        IssueRightsCommand(
+            uuid4(),
+            current_use_record,
+            uuid4(),
+            UUID("22222222-2222-4222-8222-222222222222"),
+            now,
+            "current-use authorization approved",
+        )
+    )
+    reader_port = PostgresCurrentRightsAuthority(lambda: _connect_as("rights_reader_py"))
+    assert reader_port.get_current_rights(current_use_subject) == issued
+    assert reader_port.verify_currentness(issued.source_token) == issued
+    replacement = replace(
+        current_use_record,
+        record_id=UUID("99999999-9999-4999-8999-999999999998"),
+        previous_record_id=current_use_record.record_id,
+    )
+    replaced_current_use = writer.replace(
+        ReplaceRightsCommand(
+            uuid4(),
+            current_use_record.record_id,
+            replacement,
+            uuid4(),
+            uuid4(),
+            UUID("22222222-2222-4222-8222-222222222222"),
+            now,
+            "current-use review renewed",
+        )
+    )
+    assert reader_port.get_current_rights(current_use_subject) == replaced_current_use
+    with pytest.raises(RightsAuthorityError, match="RIGHTS_SOURCE_TOKEN_STALE"):
+        reader_port.verify_currentness(issued.source_token)
 
     record_hash = "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
     token1 = "sha256:" + "1" * 64
@@ -75,7 +176,7 @@ def test_fresh_migration_lifecycle_replay_and_scoped_reader() -> None:
             ("33333333-3333-4333-8333-333333333333",),
         )
 
-    replace = """
+    replace_sql = """
         SELECT * FROM doharights_v1.replace_rights(
           'cccccccc-cccc-4ccc-8ccc-cccccccccccc', %s,
           '44444444-4444-4444-8444-444444444444',
@@ -90,7 +191,9 @@ def test_fresh_migration_lifecycle_replay_and_scoped_reader() -> None:
           '2026-09-01T00:01:00Z', 'renewed', %s)
     """
     with _connect_as("rights_producer_py") as producer:
-        replaced = producer.execute(replace, ("sha256:" + "c" * 64, record_hash, token2)).fetchone()
+        replaced = producer.execute(
+            replace_sql, ("sha256:" + "c" * 64, record_hash, token2)
+        ).fetchone()
         assert replaced == (UUID("55555555-5555-4555-8555-555555555555"), 2, token2)
 
     with _connect_as("rights_reader_py") as reader:
@@ -138,6 +241,7 @@ def test_fresh_migration_lifecycle_replay_and_scoped_reader() -> None:
         counts = admin.execute(
             "SELECT (SELECT count(*) FROM doharights_v1.rights_record),"
             "(SELECT count(*) FROM doharights_v1.rights_lifecycle_event),"
-            "(SELECT count(*) FROM doharights_v1.rights_current)"
+            "(SELECT count(*) FROM doharights_v1.rights_current),"
+            "(SELECT count(*) FROM doharights_v1.rights_record_current_use)"
         ).fetchone()
-        assert counts == (2, 4, 0)
+        assert counts == (4, 7, 1, 2)

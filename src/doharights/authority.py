@@ -36,6 +36,32 @@ class RightsLifecycleEventType(str, Enum):
     REVOKED = "revoked"
 
 
+class RightsStatus(str, Enum):
+    APPROVED = "approved"
+    APPROVED_LIMITED = "approved_limited"
+    REJECTED = "rejected"
+
+
+class RightsRetentionMode(str, Enum):
+    INDEFINITE_WHILE_CURRENT = "indefinite_while_current"
+    FIXED_EXPIRY = "fixed_expiry"
+
+
+class HistoricalAcquisitionReceiptState(str, Enum):
+    RECOVERED = "recovered"
+    NOT_RECOVERED = "not_recovered"
+
+
+class RightsEvidenceType(str, Enum):
+    PROVIDER_DATASET_METADATA = "provider_dataset_metadata"
+    PROVIDER_USAGE_POLICY = "provider_usage_policy"
+    PROVIDER_SERVICE_TERMS = "provider_service_terms"
+    SOURCE_INTEGRITY = "source_integrity"
+    SOURCE_LINEAGE = "source_lineage"
+    CURRENT_USE_REVIEW = "current_use_review"
+    HISTORICAL_ACQUISITION_STATE = "historical_acquisition_state"
+
+
 def _require_text(value: str, code: str) -> None:
     if not isinstance(value, str) or not value.strip() or value != value.strip():
         raise RightsAuthorityError(code)
@@ -112,6 +138,136 @@ class RightsPermissions:
     commercial_use: bool
     redistribution: bool
     external_model_publication: bool
+    analysis: bool
+    derivative_generation: bool
+
+    def __post_init__(self) -> None:
+        if not all(
+            type(value) is bool
+            for value in (
+                self.internal_training,
+                self.commercial_use,
+                self.redistribution,
+                self.external_model_publication,
+                self.analysis,
+                self.derivative_generation,
+            )
+        ):
+            raise RightsAuthorityError("RIGHTS_PERMISSIONS_INVALID")
+
+
+@dataclass(frozen=True, slots=True)
+class RightsSourceClassification:
+    source_type: str
+    user_created: bool
+    generated: bool
+    reference: bool
+    uploaded: bool
+    external: bool
+
+    def __post_init__(self) -> None:
+        if self.source_type not in {
+            "user_created",
+            "generated",
+            "reference",
+            "uploaded",
+            "external",
+            "mixed",
+        }:
+            raise RightsAuthorityError("RIGHTS_SOURCE_CLASSIFICATION_INVALID")
+        flags = (self.user_created, self.generated, self.reference, self.uploaded, self.external)
+        named = {
+            "user_created": self.user_created,
+            "generated": self.generated,
+            "reference": self.reference,
+            "uploaded": self.uploaded,
+            "external": self.external,
+        }
+        if (
+            not all(type(value) is bool for value in flags)
+            or not any(flags)
+            or (self.source_type != "mixed" and not named[self.source_type])
+        ):
+            raise RightsAuthorityError("RIGHTS_SOURCE_CLASSIFICATION_INVALID")
+
+
+@dataclass(frozen=True, slots=True)
+class RightsRetention:
+    allowed: bool
+    mode: RightsRetentionMode
+    scope: str
+    expires_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.allowed) is not bool or self.scope not in {"training", "runtime"}:
+            raise RightsAuthorityError("RIGHTS_RETENTION_INVALID")
+        if self.mode is RightsRetentionMode.INDEFINITE_WHILE_CURRENT:
+            if not self.allowed or self.expires_at is not None:
+                raise RightsAuthorityError("RIGHTS_RETENTION_INVALID")
+        elif self.mode is RightsRetentionMode.FIXED_EXPIRY:
+            if not self.allowed or self.expires_at is None:
+                raise RightsAuthorityError("RIGHTS_RETENTION_INVALID")
+            _require_aware(self.expires_at, "RIGHTS_RETENTION_INVALID")
+
+
+@dataclass(frozen=True, slots=True)
+class RightsEvidenceReference:
+    reference_id: str
+    evidence_type: RightsEvidenceType
+    authority: str
+    locator: str
+    observed_at: datetime
+    content_fingerprint: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_text(self.reference_id, "RIGHTS_EVIDENCE_INVALID")
+        _require_text(self.authority, "RIGHTS_EVIDENCE_INVALID")
+        _require_text(self.locator, "RIGHTS_EVIDENCE_INVALID")
+        _require_aware(self.observed_at, "RIGHTS_EVIDENCE_INVALID")
+        if self.content_fingerprint is not None and not (
+            self.content_fingerprint.startswith("sha256:") and len(self.content_fingerprint) == 71
+        ):
+            raise RightsAuthorityError("RIGHTS_EVIDENCE_INVALID")
+
+
+@dataclass(frozen=True, slots=True)
+class CurrentUseAuthorization:
+    authorized: bool
+    scope: str
+    fresh_acquisition_required: bool
+    existing_material_reuse: bool
+    historical_acquisition_receipt: HistoricalAcquisitionReceiptState
+    provider_reacquisition_requirement_found: bool
+
+    def __post_init__(self) -> None:
+        _require_text(self.scope, "RIGHTS_CURRENT_USE_INVALID")
+        booleans = (
+            self.authorized,
+            self.fresh_acquisition_required,
+            self.existing_material_reuse,
+            self.provider_reacquisition_requirement_found,
+        )
+        if not all(type(value) is bool for value in booleans):
+            raise RightsAuthorityError("RIGHTS_CURRENT_USE_INVALID")
+        if self.authorized and self.fresh_acquisition_required:
+            raise RightsAuthorityError("RIGHTS_CURRENT_USE_INVALID")
+        if self.existing_material_reuse != (
+            self.authorized and not self.fresh_acquisition_required
+        ):
+            raise RightsAuthorityError("RIGHTS_CURRENT_USE_INVALID")
+        if self.fresh_acquisition_required != self.provider_reacquisition_requirement_found:
+            raise RightsAuthorityError("RIGHTS_CURRENT_USE_INVALID")
+
+
+@dataclass(frozen=True, slots=True)
+class RightsReview:
+    reviewer_authority_id: UUID
+    reviewed_at: datetime
+
+    def __post_init__(self) -> None:
+        if self.reviewer_authority_id.int == 0:
+            raise RightsAuthorityError("RIGHTS_REVIEWER_INVALID")
+        _require_aware(self.reviewed_at, "RIGHTS_REVIEW_TIME_INVALID")
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +276,14 @@ class RightsRecord:
     source_authority: SourceAuthority
     subject: RightsSubject
     permissions: RightsPermissions
+    status: RightsStatus
+    source_classification: RightsSourceClassification
+    retention: RightsRetention
+    consent_evidence_references: tuple[str, ...]
+    jurisdiction: str
+    review: RightsReview
+    current_use_authorization: CurrentUseAuthorization
+    evidence_references: tuple[RightsEvidenceReference, ...]
     effective_at: datetime
     provenance_references: tuple[str, ...]
     producer_authority_id: UUID
@@ -129,6 +293,23 @@ class RightsRecord:
     def __post_init__(self) -> None:
         if self.record_id.int == 0 or self.producer_authority_id.int == 0:
             raise RightsAuthorityError("RIGHTS_RECORD_IDENTITY_INVALID")
+        if self.review.reviewer_authority_id == self.producer_authority_id:
+            raise RightsAuthorityError("RIGHTS_REVIEWER_PRODUCER_COLLISION")
+        if self.status in {RightsStatus.APPROVED, RightsStatus.APPROVED_LIMITED} and not (
+            self.current_use_authorization.authorized
+            and self.permissions.internal_training
+            and self.retention.allowed
+        ):
+            raise RightsAuthorityError("RIGHTS_APPROVAL_FACTS_INVALID")
+        if not self.evidence_references:
+            raise RightsAuthorityError("RIGHTS_EVIDENCE_REQUIRED")
+        if len({value.reference_id for value in self.evidence_references}) != len(
+            self.evidence_references
+        ):
+            raise RightsAuthorityError("RIGHTS_EVIDENCE_INVALID")
+        for reference in self.consent_evidence_references:
+            _require_text(reference, "RIGHTS_CONSENT_EVIDENCE_INVALID")
+        _require_text(self.jurisdiction, "RIGHTS_JURISDICTION_INVALID")
         _require_aware(self.effective_at, "RIGHTS_EFFECTIVE_AT_INVALID")
         if self.schema_version != SCHEMA_VERSION:
             raise RightsAuthorityError("RIGHTS_RECORD_SCHEMA_INVALID")
